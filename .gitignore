@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data / datasets
+data/
+*.jsonl
+*.csv
+
+# Model files / weights
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+*.ckpt
+
+# Experiment outputs / caches
+results/
+experiments/*/cache/
+.cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Secrets
+.env
+*.key
+*.pem
+*.pt

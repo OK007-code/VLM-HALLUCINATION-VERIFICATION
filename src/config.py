@@ -1,0 +1,17 @@
+# Frozen parameters selected during POPE development evaluation
+
+MIN_CONFIDENCE = 0.40
+MAX_AREA_RATIO = 0.50
+MIN_CROSS_SOURCE_IOU = 0.50
+
+VERDICTS = [
+    "SUPPORTED",
+    "CONTRADICTED",
+    "UNVERIFIED"
+]
+
+GATE_STATES = [
+    "VERIFIABLE",
+    "VERIFIABLE_WITH_SINGLE_SOURCE",
+    "AMBIGUOUS"
+]
