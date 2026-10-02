@@ -1,6 +1,11 @@
 import json
 import re
 
+try:
+    import spacy
+except ImportError:
+    spacy = None
+
 
 NUMBER_WORDS = {
     "one": 1,
@@ -33,6 +38,8 @@ SPATIAL_RELATIONS = {
     "behind": "behind",
     "in front of": "in_front_of",
 }
+
+_NLP = None
 
 
 # ============================================================
@@ -208,6 +215,7 @@ def parse_claim_json(response):
             "object",
             "count",
             "color",
+            "attribute",
             "spatial",
             "ocr"
         }:
@@ -256,6 +264,19 @@ def normalize_claim(claim):
 
         data["object"] = str(data["object"]).strip().lower()
         data["color"] = str(data["color"]).strip().lower()
+
+    elif claim_type == "attribute":
+
+        if (
+            "object" not in data
+            or "attribute" not in data
+            or "value" not in data
+        ):
+            return None
+
+        data["object"] = str(data["object"]).strip().lower()
+        data["attribute"] = str(data["attribute"]).strip().lower()
+        data["value"] = str(data["value"]).strip().lower()
 
     elif claim_type == "spatial":
 
@@ -325,7 +346,10 @@ def _singularize(noun):
     if noun.endswith("ies"):
         return noun[:-3] + "y"
 
-    if noun.endswith("s") and not noun.endswith("ss"):
+    if noun.endswith(("ches", "shes")):
+        return noun[:-2]
+
+    if noun.endswith("s") and not noun.endswith(("ss", "us", "is", "ch", "sh")):
         return noun[:-1]
 
     return noun
@@ -336,8 +360,179 @@ def _number_value(value):
     return NUMBER_WORDS.get(value, int(value) if value.isdigit() else None)
 
 
+def _fallback_head(phrase):
+    phrase = re.sub(r"\s+", " ", phrase.lower()).strip(" ,.;:!?\"'")
+    phrase = re.sub(r"^(?:a|an|the|and)\s+", "", phrase)
+
+    # Prepositional tails describe context or contents, not the entity head.
+    phrase = re.split(
+        r"\s+(?:on|in|at|near|beside|behind|under|with|to|of|from)\s+",
+        phrase,
+        maxsplit=1,
+    )[0]
+
+    words = [word for word in phrase.split() if word not in COLORS]
+    while words and (words[-1].endswith("ing") or words[-1].endswith("ed")):
+        words.pop()
+
+    if not words:
+        return ""
+
+    return _singularize(words[-1])
+
+
+def _load_parser():
+    global _NLP
+
+    if _NLP is not None:
+        return _NLP
+
+    if spacy is None:
+        return None
+
+    try:
+        _NLP = spacy.load("en_core_web_sm")
+    except OSError:
+        return None
+
+    return _NLP
+
+
+def _head(noun_chunk):
+    return noun_chunk.root.lemma_.lower()
+
+
+def _attribute_claim(object_name, value):
+    return {
+        "type": "attribute",
+        "data": {
+            "object": object_name,
+            "attribute": "color",
+            "value": value,
+        },
+    }
+
+
+def _extract_claims_with_parser(vlm_answer):
+    parser = _load_parser()
+    if parser is None:
+        return []
+
+    doc = parser(vlm_answer)
+    noun_chunks = list(doc.noun_chunks)
+    claims = []
+    seen_chunks = set()
+
+    for chunk in noun_chunks:
+        head = _head(chunk)
+        if head in {"image", "background", "side", "patch", "face", "ear", "paw", "leg"}:
+            continue
+
+        seen_chunks.add((chunk.start, chunk.end))
+        claims.append({"type": "object", "data": {"object": head}})
+
+        number = next(
+            (token.text for token in chunk if token.like_num),
+            None,
+        )
+        if number is not None:
+            count = _number_value(number)
+            if count is not None:
+                claims.append({
+                    "type": "count",
+                    "data": {"object": head, "count": count},
+                })
+
+        if chunk.root.det_ in {"a", "an"}:
+            claims.append({
+                "type": "count",
+                "data": {"object": head, "count": 1},
+            })
+
+        for token in chunk:
+            if token.lemma_.lower() in COLORS and token.dep_ == "amod":
+                # A patch/part description is not the color of the whole
+                # detected object and should not reach ColorVerifier.
+                if head not in {"patch", "face", "ear", "paw", "leg"}:
+                    claims.append(_attribute_claim(head, token.lemma_))
+
+    for token in doc:
+        if token.lemma_.lower() not in COLORS or token.dep_ != "amod":
+            continue
+
+        if token.head.pos_ != "NOUN":
+            continue
+
+        for chunk in noun_chunks:
+            if chunk.root == token.head:
+                head = _head(chunk)
+                if head in {"patch", "face", "ear", "paw", "leg"}:
+                    continue
+                claims.append(_attribute_claim(head, token.lemma_))
+                break
+
+    relation_pattern = "|".join(
+        sorted(SPATIAL_RELATIONS, key=len, reverse=True)
+    )
+    for match in re.finditer(
+        rf"\b(?:the|there\s+is\s+(?:a|an|the)?)\s+([a-z][a-z -]*?)\s+"
+        rf"(?:is\s+)?({relation_pattern})\s+the\s+([a-z][a-z -]*?)"
+        rf"(?=[,.!?;]|\s+and\s+|$)",
+        str(vlm_answer),
+        flags=re.IGNORECASE,
+    ):
+        claims.append({
+            "type": "spatial",
+            "data": {
+                "object1": _fallback_head(match.group(1)),
+                "relation": SPATIAL_RELATIONS[match.group(2).lower()],
+                "object2": _fallback_head(match.group(3)),
+            },
+        })
+
+    for match in re.finditer(
+        r"\bthe\s+([a-z][a-z -]*?)\s+is\s+looking\s+to\s+the\s+"
+        r"(left|right)\s+side\s+of\s+the\s+([a-z][a-z -]*?)"
+        r"(?=[,.!?;]|\s+which\s+|$)",
+        str(vlm_answer),
+        flags=re.IGNORECASE,
+    ):
+        claims.append({
+            "type": "spatial",
+            "data": {
+                "object1": _fallback_head(match.group(1)),
+                "relation": match.group(2).lower(),
+                "object2": _fallback_head(match.group(3)),
+            },
+        })
+
+    for token in doc:
+        if not token.like_num or token.dep_ not in {"nummod", "quantmod"}:
+            continue
+        if token.head.pos_ == "NOUN":
+            claims.append({
+                "type": "count",
+                "data": {
+                    "object": token.head.lemma_.lower(),
+                    "count": _number_value(token.text),
+                },
+            })
+
+    normalized_claims = []
+    for claim in claims:
+        normalized = normalize_claim(claim)
+        if normalized is not None:
+            normalized_claims.append(normalized)
+
+    return deduplicate_claims(normalized_claims)
+
+
 def extract_claims_from_text(vlm_answer):
     """Extract verifiable claims directly when no extraction model is supplied."""
+
+    parser_claims = _extract_claims_with_parser(str(vlm_answer))
+    if parser_claims:
+        return parser_claims
 
     text = re.sub(r"\s+", " ", str(vlm_answer)).strip()
     claims = []
@@ -356,16 +551,32 @@ def extract_claims_from_text(vlm_answer):
         sorted(SPATIAL_RELATIONS, key=len, reverse=True)
     )
     for match in re.finditer(
-        rf"\bthe\s+([a-z][a-z -]*?)\s+(?:is\s+)?({relation_pattern})\s+the\s+([a-z][a-z -]*?)(?=[,.!?;]|\s+and\s+|$)",
+        rf"\b(?:the|there\s+is\s+(?:a|an|the)?)\s+([a-z][a-z -]*?)\s+(?:is\s+)?({relation_pattern})\s+the\s+([a-z][a-z -]*?)(?=[,.!?;]|\s+and\s+|$)",
         text,
         flags=re.IGNORECASE,
     ):
         claims.append({
             "type": "spatial",
             "data": {
-                "object1": _singularize(match.group(1)),
+                "object1": _fallback_head(match.group(1)),
                 "relation": SPATIAL_RELATIONS[match.group(2).lower()],
-                "object2": _singularize(match.group(3)),
+                "object2": _fallback_head(match.group(3)),
+            },
+        })
+
+    for match in re.finditer(
+        r"\bthe\s+([a-z][a-z -]*?)\s+is\s+looking\s+to\s+the\s+"
+        r"(left|right)\s+side\s+of\s+the\s+([a-z][a-z -]*?)"
+        r"(?=[,.!?;]|\s+which\s+|$)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        claims.append({
+            "type": "spatial",
+            "data": {
+                "object1": _fallback_head(match.group(1)),
+                "relation": match.group(2).lower(),
+                "object2": _fallback_head(match.group(3)),
             },
         })
 
@@ -381,7 +592,7 @@ def extract_claims_from_text(vlm_answer):
         if count is not None:
             claims.append({
                 "type": "count",
-                "data": {"object": _singularize(match.group(2)), "count": count},
+                "data": {"object": _fallback_head(match.group(2)), "count": count},
             })
 
     # Adjective-noun and noun-is-adjective color descriptions.
@@ -391,10 +602,14 @@ def extract_claims_from_text(vlm_answer):
         text,
         flags=re.IGNORECASE,
     ):
+        object_name = _fallback_head(match.group(2))
+        if object_name in {"patch", "face", "ear", "paw", "leg"}:
+            continue
+
         claims.append({
             "type": "color",
             "data": {
-                "object": _singularize(match.group(2)),
+                "object": object_name,
                 "color": match.group(1).lower(),
             },
         })
@@ -404,10 +619,14 @@ def extract_claims_from_text(vlm_answer):
         text,
         flags=re.IGNORECASE,
     ):
+        object_name = _fallback_head(match.group(1))
+        if object_name in {"patch", "face", "ear", "paw", "leg"}:
+            continue
+
         claims.append({
             "type": "color",
             "data": {
-                "object": _singularize(match.group(1)),
+                "object": object_name,
                 "color": match.group(2).lower(),
             },
         })
@@ -420,9 +639,23 @@ def extract_claims_from_text(vlm_answer):
         text,
         flags=re.IGNORECASE,
     ):
-        noun = _singularize(match.group(1))
+        noun = _fallback_head(match.group(1))
         if noun and not noun.isdigit():
             claims.append({"type": "object", "data": {"object": noun}})
+
+    for match in re.finditer(
+        r"(?<!with )\b(?:a|an)\s+([a-z][a-z -]*?)"
+        r"(?=[,.!?;]|\s+(?:and|with|to|on|in|near|which)\s|$)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        noun = _fallback_head(match.group(1))
+        if noun and noun not in {"patch", "face", "ear", "paw", "leg"}:
+            claims.append({"type": "object", "data": {"object": noun}})
+            claims.append({
+                "type": "count",
+                "data": {"object": noun, "count": 1},
+            })
 
     normalized_claims = []
     for claim in claims:

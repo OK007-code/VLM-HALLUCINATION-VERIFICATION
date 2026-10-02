@@ -35,9 +35,9 @@ class VLMVerificationPipeline:
     def verify(
         self,
         image_path,
-        question,
         vlm_answer,
-        extracted_claims=None
+        extracted_claims=None,
+        question=None
     ):
 
         # =====================================================
@@ -193,10 +193,14 @@ class VLMVerificationPipeline:
             # COLOR CLAIM
             # =================================================
 
-            elif claim_type == "color":
+            elif claim_type in {"color", "attribute"}:
 
                 object_name = data["object"]
-                claimed_color = data["color"]
+                claimed_color = (
+                    data["color"]
+                    if claim_type == "color"
+                    else data["value"]
+                )
 
                 yolo_detections = [
                     detection
@@ -204,8 +208,16 @@ class VLMVerificationPipeline:
                     if detection["object"] == object_name
                 ]
 
+                color_detections = yolo_detections
+
+                if not color_detections:
+                    color_detections = self.dino.detect(
+                        image_path,
+                        object_name
+                    )
+
                 # No detected object
-                if not yolo_detections:
+                if not color_detections:
 
                     results.append({
                         "claim": claim,
@@ -222,7 +234,7 @@ class VLMVerificationPipeline:
 
                 # Use highest-confidence detection
                 best_detection = max(
-                    yolo_detections,
+                    color_detections,
                     key=lambda x: x["confidence"]
                 )
 
@@ -274,7 +286,6 @@ class VLMVerificationPipeline:
 
         return {
             "image": image_path,
-            "question": question,
             "vlm_answer": vlm_answer,
             "claims": claims,
             "results": results

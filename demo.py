@@ -51,7 +51,7 @@ print("SmolVLM loaded successfully.")
 # GENERATE VLM RESPONSE
 # ============================================================
 
-def ask_vlm(image_path, question):
+def ask_vlm(image_path):
 
     image = Image.open(image_path).convert("RGB")
 
@@ -69,7 +69,7 @@ def ask_vlm(image_path, question):
                         "Describe every visible object, count, color, spatial "
                         "relationship, and readable text that is relevant. "
                         "Do not answer with only one word.\n\n"
-                        f"User question: {question}"
+                        "Describe the image and report only visible, verifiable facts."
                     )
                 }
             ]
@@ -118,7 +118,6 @@ def ask_vlm(image_path, question):
 
 def print_results(
     image_path,
-    question,
     vlm_answer,
     results
 ):
@@ -130,9 +129,6 @@ def print_results(
     print("=" * 70)
 
     print(f"\nImage: {image_path}")
-
-    print(f"\nQuestion / Context:")
-    print(question)
 
     # --------------------------------------------------------
     # VLM RESPONSE
@@ -401,22 +397,6 @@ def main():
         return
 
     # --------------------------------------------------------
-    # USER CONTEXT / QUESTION
-    # --------------------------------------------------------
-
-    question = input(
-        "\nEnter your question/context: "
-    ).strip()
-
-    if not question:
-
-        print(
-            "Error: Question/context cannot be empty."
-        )
-
-        return
-
-    # --------------------------------------------------------
     # STEP 1
     # GENERATE RESPONSE USING SMOLVLM
     # --------------------------------------------------------
@@ -426,8 +406,7 @@ def main():
     print("-" * 70)
 
     vlm_answer = ask_vlm(
-        image_path,
-        question
+        image_path
     )
 
     print("\nVLM response generated successfully.")
@@ -470,7 +449,6 @@ def main():
 
     results = pipeline.verify(
         image_path=image_path,
-        question=question,
         vlm_answer=vlm_answer,
         extracted_claims=extracted_claims
     )
@@ -482,7 +460,6 @@ def main():
 
     print_results(
         image_path=image_path,
-        question=question,
         vlm_answer=vlm_answer,
         results=results
     )
